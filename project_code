@@ -1,0 +1,1135 @@
+# SCALAR IMPLICATURE DATASET
+# Manual Extraction 
+
+# STAGE ORDER:
+#   1.  Run corpus helpers to browse sentences
+#       Fill in manual_extraction_sheet.csv (OFFLINE)
+#   2.  Load and validate manual extractions
+#   3.  Export annotation sheets — Task 1 (keep/discard)
+#   4.  Annotators fill in Task 1 sheets (OFFLINE)
+#   5.  Merge Task 1 annotations + compute IAA
+#   6.  Build hypothesis pairs (fillers come from sheet)
+#   7.  Dev / test split (75% test | 25% dev)
+#   8.  Run models (mDeBERTa, Claude Haiku ZS/CoT, Sabia ZS/CoT)
+#   9.  Evaluate with bootstrap confidence intervals
+#  10.  Export CoT traces — Task 2 (rubric scoring)
+#  11.  Annotators fill in Task 2 sheets
+#  12.  Merge Task 2 annotations + compute Inter-Annotation Agreement
+#
+# CORPUS ASSIGNMENT:
+#   CETENFolha                    → formal_written
+#   CORAA (Prepared Speech)       → prepared_spoken
+#   NURC-SP                       → spontaneous_spoken
+
+
+# FILES YOU NEED BEFORE RUNNING:
+#   CETENFolha-1.0.gz
+#   coraa_merged.csv   (merged from 3 CORAA CSV parts)
+#   nurc_merged.csv    (merged from 3 NURC-SP CSV parts)
+#   ANTHROPIC_API_KEY and MARITACA_API_KEY in Colab secrets
+
+import re
+import os
+import gzip
+import random
+import numpy as np
+import pandas as pd
+import requests
+import torch
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score, f1_score,
+    classification_report, cohen_kappa_score
+)
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification
+)
+
+try:
+    from google.colab import userdata
+    ANTHROPIC_KEY  = userdata.get("ANTHROPIC_API_KEY")
+    MARITACA_KEY = userdata.get("MARITACA_API_KEY")
+except Exception:
+    ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+    MARITACA_KEY = os.environ.get("MARITACA_API_KEY", "")
+
+# constants
+ANNOTATORS = ["annotator1", "annotator2"]
+
+SCALAR_TERMS = [
+    "alguns", "algum", "alguma", "algumas",
+    "muitos", "muitas", "poucos", "poucas",
+    "vários", "várias", "às vezes", "pode", 
+]
+
+scalar_map = {
+    "alguns": "todos",    "algum": "todo",
+    "alguma": "toda",     "algumas": "todas",
+    "muitos": "todos",    "muitas": "todas",
+    "poucos": "todos",    "poucas": "todas",
+    "vários": "todos",    "várias": "todas",
+    "às vezes": "sempre",
+    "pode": "deve",
+}
+
+# Corpus configuration
+CORPORA = [
+    {
+        "filepath":      "cetenfolha_sentences.csv",
+        "corpus_name":   "CETENFolha",
+        "style":         "formal_written",
+        "text_column":   "text",
+        "filter_column": None,
+        "filter_value":  None,
+        "target":        280,
+    },
+    {
+        "filepath":      "coraa_merged.csv",
+        "corpus_name":   "CORAA",
+        "style":         "prepared_spoken",
+        "text_column":   "text",
+        "filter_column": "speech_style",
+        "filter_value":  "Prepared Speech",
+        "target":        280,
+    },
+    {
+        "filepath":      "nurc_merged.csv",
+        "corpus_name":   "NURC-SP",
+        "style":         "spontaneous_spoken",
+        "text_column":   "text",
+        "filter_column": None,
+        "filter_value":  None,
+        "target":        280,
+    },
+   
+]
+
+ # STAGE 1 — CORPUS HELPERS AND MANUAL EXTRACTION
+
+#
+# WORKFLOW:
+#   Step 1: Run cetenfolha_to_csv() to convert CETENFolha
+#   Step 2: Run create_extraction_sheet() for blank sheet
+#   Step 3: Run browse_all() to print possible sentences
+#   Step 4: Copy chosen sentences into extraction sheet
+#           (open manual_extraction_sheet.csv in Google Sheets
+#            alongside browse output)
+#   Step 5: Add filler rows at bottom (corpus = filler)
+#   Step 6: Download sheet as CSV, upload to Colab
+#   Step 7: Run Stage 2 to load and validate
+#
+# Do NOT run Stage 2 until extraction sheet
+# is fully filled in and uploaded.
+
+
+def cetenfolha_to_csv(filepath="CETENFolha-1.0.gz",
+                      output_csv="cetenfolha_sentences.csv",
+                      max_sentences=50000):
+    """
+    Convert CETENFolha .gz file into a searchable CSV.
+    Run this ONCE before browsing. Then open the output
+    CSV in Google Sheets to browse sentences.
+
+    Usage:
+        cetenfolha_to_csv("CETENFolha-1.0.gz")
+    """
+    if not os.path.exists(filepath):
+        print(f"  ERROR: {filepath} not found.")
+        print(f"  Upload CETENFolha-1.0.gz to Colab first.")
+        return pd.DataFrame()
+
+    print(f"Converting {filepath} → {output_csv}...")
+    f_opener = gzip.open if filepath.endswith(".gz") else open
+    results  = []
+
+    with f_opener(filepath, "rt", encoding="latin-1") as f:
+        text = f.read()
+
+    text      = re.sub(r"<[^>]+>", " ", text)
+    text      = re.sub(r"\s+", " ", text)
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+
+    for i, sent in enumerate(sentences):
+        sent = sent.strip()
+        if len(sent.split()) < 6 or len(sent.split()) > 60:
+            continue
+        if re.search(r"[<>{}\\|]", sent):
+            continue
+        words       = sent.split()
+        alpha_ratio = sum(1 for w in words if w.isalpha()) / len(words)
+        if alpha_ratio < 0.5:
+            continue
+        results.append({
+            "line_number": i,
+            "text":        sent,
+            "corpus":      "CETENFolha",
+            "style":       "formal_written",
+        })
+        if len(results) >= max_sentences:
+            break
+
+    df = pd.DataFrame(results)
+    df.to_csv(output_csv, index=False, encoding="utf-8")
+    print(f"  Done. Saved {len(df)} sentences → {output_csv}")
+    print(f"  Download and open in Google Sheets to browse.")
+    return df
+
+
+def merge_csvs(filepaths, output_filename, text_column="text"):
+    """
+    Merge multiple CSV files into one and save.
+    Use this to combine the 3-part CORAA and NURC-SP files.
+
+    Usage:
+        merge_csvs(
+            ["coraa_part1.csv", "coraa_part2.csv", "coraa_part3.csv"],
+            "coraa_merged.csv"
+        )
+        merge_csvs(
+            ["nurc_part1.csv", "nurc_part2.csv", "nurc_part3.csv"],
+            "nurc_merged.csv"
+        )
+    """
+    dfs = []
+    for f in filepaths:
+        try:
+            df = pd.read_csv(f, low_memory=False)
+            print(f"  {f}: {len(df)} rows")
+            dfs.append(df)
+        except FileNotFoundError:
+            print(f"  WARNING: {f} not found — skipping.")
+
+    if not dfs:
+        print("  No files loaded.")
+        return pd.DataFrame()
+
+    merged = pd.concat(dfs, ignore_index=True).drop_duplicates()
+
+    if text_column in merged.columns:
+        merged = merged.dropna(subset=[text_column])
+
+    merged.to_csv(output_filename, index=False, encoding="utf-8")
+    print(f"\n  Total rows: {len(merged)}")
+    print(f"  Saved: {output_filename}")
+    return merged
+
+
+def create_extraction_sheet():
+    """
+    Create a blank extraction sheet for manual filling.
+
+    Columns:
+      premise     — sentence you selected from the corpus
+      scalar_term — the weak scalar word in the sentence
+      hypothesis  — leave blank for corpus sentences (auto-generated)
+                    REQUIRED for filler rows
+      label       — leave blank for corpus sentences (auto = neutral)
+                    REQUIRED for filler rows: entailment or contradiction
+      corpus      — CETENFolha / CORAA / NURC-SP / filler
+      style       — formal_written / formal_spoken / informal_spoken
+      source_line — optional: row number in source file
+      extractor   — your name
+      notes       — anything worth flagging
+
+    FILLER ROWS (corpus = filler):
+      Entailment:
+        premise    : Todos os alunos passaram no exame.
+        hypothesis : Alguns alunos passaram no exame.
+        label      : entailment
+        scalar_term: todos
+        corpus     : filler
+      Contradiction:
+        premise    : Nenhum aluno passou no exame.
+        hypothesis : Alguns alunos passaram no exame.
+        label      : contradiction
+        scalar_term: nenhum
+        corpus     : filler
+
+    Target: 50 entailment + 50 contradiction fillers
+            distributed across all three styles.
+    """
+    sheet = pd.DataFrame(columns=[
+        "premise", "scalar_term", "hypothesis", "label",
+        "corpus", "style", "source_line", "extractor", "notes",
+    ])
+    sheet.to_csv("manual_extraction_sheet.csv", index=False,
+                 encoding="utf-8")
+    print("Created: manual_extraction_sheet.csv")
+    print("Fill this in before running Stage 2.")
+    print("Remember: fill hypothesis + label for ALL filler rows.")
+
+
+def browse_all(corpora=CORPORA, scalar_terms=SCALAR_TERMS,
+               n_per_term=20, informal_threshold=200):
+    """
+    Browse all scalar terms across all corpora and print results.
+    Copy sentences you want into manual_extraction_sheet.csv.
+
+   
+    Usage:
+        browse_all(n_per_term=20)
+        browse_all(corpora=[CORPORA[0]], n_per_term=30)
+        browse_all(scalar_terms=["alguns", "muitos"], n_per_term=30)
+    """
+    nurc_count = 0
+
+    for corpus in corpora:
+        filepath       = corpus["filepath"]
+        corpus_name    = corpus["corpus_name"]
+        style          = corpus["style"]
+        text_col       = corpus["text_column"]
+        filter_column  = corpus.get("filter_column")
+        filter_value   = corpus.get("filter_value")
+        is_backup      = "backup_for" in corpus
+
+        # Load corpus
+        try:
+            df = pd.read_csv(filepath, low_memory=False)
+        except FileNotFoundError:
+            print(f"  FILE NOT FOUND: {filepath}")
+            print(f"  Make sure this file is uploaded to Colab.")
+            continue
+
+        if text_col not in df.columns:
+            print(f"  ERROR: column '{text_col}' not found.")
+            print(f"  Available columns: {df.columns.tolist()}")
+            continue
+
+        # Apply filter
+        if filter_column and filter_value:
+            if filter_column not in df.columns:
+                print(f"  ERROR: filter column '{filter_column}' "
+                      f"not found.")
+                continue
+            df = df[df[filter_column] == filter_value].copy()
+            print(f"  Rows after filter: {len(df)}")
+
+        # Browse each scalar term
+        corpus_sentence_count = 0
+
+        for term in scalar_terms:
+            mask    = df[text_col].str.contains(
+                r"\b" + re.escape(term) + r"\b",
+                case=False, na=False, regex=True
+            )
+            matches = df[mask].head(n_per_term)
+            total   = mask.sum()
+
+            if total == 0:
+                continue
+
+            shown = 0
+            print(f"\n  ── Scalar term: '{term}' "
+                  f"({total} total matches, "
+                  f"showing up to {n_per_term}) ──\n")
+
+            for i, row in matches.iterrows():
+                sentence = str(row[text_col]).strip()
+                words    = sentence.split()
+                if len(words) < 6 or len(words) > 50:
+                    continue
+                print(f"  [row {i} | {corpus_name} | "
+                      f"{style} | {term}]")
+                print(f"  {sentence}")
+                print()
+                shown += 1
+
+            corpus_sentence_count += shown
+
+      
+
+def browse_all_to_file(output_file="browse_results.txt",
+                       corpora=CORPORA,
+                       scalar_terms=SCALAR_TERMS,
+                       n_per_term=20,
+                       informal_threshold=200):
+    """
+    Same as browse_all but saves to a text file instead of
+    printing.
+    Download browse_results.txt from the file panel and open
+    in any text editor or Google Docs.
+
+    Usage:
+        browse_all_to_file(n_per_term=20)
+    """
+    lines      = []
+    nurc_count = 0
+
+    for corpus in corpora:
+        filepath       = corpus["filepath"]
+        corpus_name    = corpus["corpus_name"]
+        style          = corpus["style"]
+        text_col       = corpus["text_column"]
+        filter_column  = corpus.get("filter_column")
+        filter_value   = corpus.get("filter_value")
+        is_backup      = "backup_for" in corpus
+
+        if is_backup:
+            if nurc_count >= informal_threshold:
+                lines.append(f"\nBACKUP SKIPPED — NURC-SP had "
+                             f"{nurc_count} sentences "
+                             f"(threshold: {informal_threshold})")
+                continue
+            else:
+                lines.append("\n" + "=" * 70)
+                lines.append(f"BACKUP ACTIVATED: CORAA Spontaneous Speech")
+                lines.append(f"NURC-SP only had {nurc_count} sentences")
+                lines.append("=" * 70)
+        else:
+            lines.append("\n" + "=" * 70)
+            lines.append(f"CORPUS: {corpus_name}  |  Style: {style}")
+            if filter_column:
+                lines.append(f"Filter: {filter_column} = "
+                             f"'{filter_value}'")
+            lines.append("=" * 70)
+
+        try:
+            df = pd.read_csv(filepath, low_memory=False)
+        except FileNotFoundError:
+            lines.append(f"FILE NOT FOUND: {filepath}")
+            continue
+
+        if text_col not in df.columns:
+            lines.append(f"ERROR: column '{text_col}' not found.")
+            lines.append(f"Columns: {df.columns.tolist()}")
+            continue
+
+        if filter_column and filter_value:
+            df = df[df[filter_column] == filter_value].copy()
+
+        corpus_sentence_count = 0
+
+        for term in scalar_terms:
+            mask    = df[text_col].str.contains(
+                r"\b" + re.escape(term) + r"\b",
+                case=False, na=False, regex=True
+            )
+            matches = df[mask].head(n_per_term)
+            total   = mask.sum()
+
+            if total == 0:
+                continue
+
+            lines.append(f"\n── Scalar term: '{term}' "
+                        f"({total} total, "
+                        f"showing up to {n_per_term}) ──\n")
+
+            for i, row in matches.iterrows():
+                sentence = str(row[text_col]).strip()
+                words    = sentence.split()
+                if len(words) < 6 or len(words) > 50:
+                    continue
+                lines.append(f"[row {i} | {corpus_name} | "
+                             f"{style} | {term}]")
+                lines.append(sentence)
+                lines.append("")
+                corpus_sentence_count += 1
+
+        if corpus_name == "NURC-SP":
+            nurc_count = corpus_sentence_count
+            lines.append(f"\nNURC-SP total: {nurc_count} sentences")
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    print(f"Saved {len(lines)} lines → {output_file}")
+    print("Download from the Colab file panel.")
+
+
+def print_extraction_guidelines():
+    print("""
+MANUAL EXTRACTION GUIDELINES
+
+
+CORPUS ASSIGNMENT:
+  CETENFolha                 → formal_written
+  CORAA (Prepared Speech)    → prepared_spoken
+  NURC-SP                    → spontaneous_spoken
+
+WORKFLOW:
+  1. Run cetenfolha_to_csv() to convert CETENFolha
+  2. Run create_extraction_sheet() to create blank sheet
+  3. Run browse_all() or browse_all_to_file() to see sentences
+  4. Copy good sentences into manual_extraction_sheet.csv
+     (open in Google Sheets alongside Colab output)
+  5. Add ~100 filler rows at the bottom (see below)
+  6. Download sheet as CSV and upload to Colab
+  7. Run Stage 2
+
+Include sentences that:
+   Contain scalar term in a clear assertive context
+   Self-contained — understandable without necessary further context
+   Between 8 and 40 words long
+   Sound natural for their assigned register:
+    formal_written  — newspaper-style, complete sentences,
+                        formal vocabulary
+    prepared_spoken   — professional, direct, no colloquialisms
+    spontaneous_spoken — contractions, everyday words
+
+EXCLUDE sentences that:
+   - Scalar term is part of a name or fixed expression
+   - Require additional context to understand
+   - Is a question or negation
+   - Register does not match assigned style
+
+FILLER ROWS (add ~100 rows at bottom of your sheet):
+  corpus = filler
+  Fill hypothesis and label manually for every filler row
+
+  Entailment pattern (todos/todas → alguns/algumas):
+    premise    : Todos os médicos assinaram o documento.
+    hypothesis : Alguns médicos assinaram o documento.
+    label      : entailment | scalar_term: todos
+
+  Contradiction pattern (nenhum/nenhuma → alguns/algumas):
+    premise    : Nenhum médico assinou o documento.
+    hypothesis : Alguns médicos assinaram o documento.
+    label      : contradiction | scalar_term: nenhum
+
+  Target: 50 entailment + 50 contradiction
+          17 of each per style
+
+TARGET COUNTS for corpus sentences:
+  CETENFolha  → 280  (formal_written)
+  CORAA       → 280  (prepared_spoken — Prepared Speech only)
+  NURC-SP     → 280  (spontaneous_spoken)
+  Total raw   → ~840 + 100 fillers = ~940 in sheet
+  After annotation (≈75% kept) → ~630 neutral + 100 fillers
+  Final dataset → ~730 total
+
+SCALAR TERMS TO SEARCH FOR:
+  Quantifiers : alguns, algum, alguma, algumas, muitos,
+                muitas, poucos, poucas, vários, várias,
+  Adverbials  : às vezes
+  Modals      : pode
+""")
+
+
+# run one at a time
+
+# Step 1 — convert CETENFolha (run once)
+cetenfolha_to_csv("CETENFolha-1.0.gz")
+
+#Step 2 — merge CORAA and NURC-SP if not already done
+merge_csvs(["metadata_train_final.csv","metadata_dev_final.csv","metadata_test_final.csv"],
+           "coraa_merged.csv")
+merge_csvs(["audios_train_metadata.csv","audios_test_metadata.csv","audios_dev_metadata.csv"],
+           "nurc_merged.csv")
+
+# Step 3 — create blank extraction sheet (run once)
+create_extraction_sheet()
+
+# Step 4 — print guidelines
+print_extraction_guidelines()
+
+# Step 5 — browse all corpora and scalar terms
+browse_all(n_per_term=20)
+
+# Step 5 alt — save to file if output is too long
+browse_all_to_file(output_file="browse_all_results.txt",
+                   n_per_term=99999)
+
+# Step 5 one corpus at a time:
+browse_all(corpora=[CORPORA[0]], n_per_term=99999)  # CETENFolha
+browse_all(corpora=[CORPORA[1]], n_per_term=99999)  # CORAA 
+browse_all(corpora=[CORPORA[2]], n_per_term=99999)  # NURC-SP
+
+# Step 5 one term at a time:
+browse_all(scalar_terms=["alguns"], n_per_term=99999)
+browse_all(scalar_terms=["muitos", "muitas"], n_per_term=99999)
+
+
+
+# STAGE 2 — LOAD AND VALIDATE MANUAL EXTRACTIONS
+
+
+def load_manual_extractions(filepaths):
+    """
+    Load one or more manually filled extraction sheets.
+
+    Usage (single):
+        raw_df = load_manual_extractions(
+            ["manual_extraction_sheet.csv"])
+    Usage (multiple extractors):
+        raw_df = load_manual_extractions([
+            "extraction_person1.csv",
+            "extraction_person2.csv",
+        ])
+    """
+    dfs = []
+    for fp in filepaths:
+        try:
+            df = pd.read_csv(fp, encoding="utf-8")
+            print(f"  Loaded {fp}: {len(df)} rows")
+            dfs.append(df)
+        except FileNotFoundError:
+            print(f"  WARNING: {fp} not found — skipping.")
+
+    if not dfs:
+        print("  ERROR: No extraction files found.")
+        return pd.DataFrame()
+
+    combined = pd.concat(dfs, ignore_index=True)
+
+    required = ["premise", "scalar_term", "corpus", "style"]
+    missing  = [c for c in required if c not in combined.columns]
+    if missing:
+        print(f"  ERROR: Missing columns: {missing}")
+        return pd.DataFrame()
+
+    combined = combined.dropna(subset=["premise"])
+    combined["premise"]     = combined["premise"].str.strip()
+    combined["scalar_term"] = (combined["scalar_term"]
+                                .str.strip().str.lower())
+    combined = combined.drop_duplicates(subset=["premise"])
+
+    print(f"\n  Total after deduplication: {len(combined)}")
+    print(f"\n  By corpus:")
+    print(combined["corpus"].value_counts().to_string())
+    print(f"\n  By style:")
+    print(combined["style"].value_counts().to_string())
+    print(f"\n  By scalar term:")
+    print(combined["scalar_term"].value_counts().to_string())
+
+    unknown = (set(combined["scalar_term"])
+               - set(scalar_map.keys())
+               - {"todos", "todas", "nenhum", "nenhuma",
+                  "ninguém", "todo mundo"})
+    if unknown:
+        print(f"\n  WARNING: These scalar terms have no auto-mapping "
+              f"and will need manually written hypotheses: {unknown}")
+
+    combined.to_csv("raw_extractions.csv", index=False,
+                    encoding="utf-8")
+    print(f"\n  Saved raw_extractions.csv")
+    return combined
+
+
+print("-" * 60)
+print("STAGE 2: LOADING MANUAL EXTRACTIONS")
+print("-" * 60)
+
+EXTRACTION_FILES = ["manual_extraction_sheet.csv"]
+raw_df = load_manual_extractions(EXTRACTION_FILES)
+
+
+
+# STAGE 3 — EXPORT ANNOTATION SHEETS (TASK 1)
+
+print("\n" + "=" * 60)
+print("STAGE 3: EXPORTING ANNOTATION SHEETS (TASK 1)")
+print("=" * 60)
+print("""
+TASK 1 INSTRUCTIONS FOR ANNOTATORS:
+  Each annotator receives an identical CSV file.
+  For each sentence fill in the 'keep' column:
+    1 = keep (natural, suitable for the dataset)
+    0 = discard (noisy or unnatural)
+  Fill in 'notes' optionally to explain discard decisions.
+  Do NOT discuss decisions with other annotators until done.
+""")
+
+if len(raw_df) > 0:
+    annotation_base = raw_df[
+        ["premise", "scalar_term", "corpus", "style"]
+    ].copy()
+    annotation_base["keep"]  = ""
+    annotation_base["notes"] = ""
+
+    for ann in ANNOTATORS:
+        fname = f"annotation_task1_{ann}.csv"
+        annotation_base.to_csv(fname, index=False)
+        print(f"  Exported: {fname}")
+
+    print(f"\n>>> PAUSE HERE.")
+    print(f">>> Send annotation_task1_<name>.csv to each annotator.")
+    print(f">>> Collect all 4 completed files before Stage 5.")
+else:
+    print("  raw_df is empty. Complete Stage 2 first.")
+
+
+
+
+# STAGE 5 — MERGE TASK 1 ANNOTATIONS + COMPUTE INTER ANNOTATOR AGREEMENT
+
+print("\n" + "=" * 60)
+print("STAGE 5: MERGING TASK 1 ANNOTATIONS AND COMPUTING IAA")
+print("=" * 60)
+
+def merge_task1_annotations(annotators):
+    dfs = []
+    for ann in annotators:
+        fname = f"annotation_task1_{ann}.csv"
+        try:
+            df = pd.read_csv(fname)
+            df = df[["premise", "keep"]].rename(
+                columns={"keep": f"keep_{ann}"}
+            )
+            dfs.append(df)
+            print(f"  Loaded: {fname}")
+        except FileNotFoundError:
+            print(f"  WARNING: {fname} not found — skipping.")
+
+    if not dfs:
+        print("  No annotation files found. Run Stage 3 first.")
+        return pd.DataFrame()
+
+    merged = dfs[0]
+    for df in dfs[1:]:
+        merged = merged.merge(df, on="premise", how="inner")
+
+    keep_cols    = [f"keep_{ann}" for ann in annotators
+                    if f"keep_{ann}" in merged.columns]
+    merged       = merged.dropna(subset=keep_cols)
+    for col in keep_cols:
+        merged[col] = merged[col].astype(int)
+
+    # Pairwise Cohen's Kappa
+    print("\n  Pairwise Cohen's Kappa (Task 1 — keep/discard):")
+    print("  " + "-" * 45)
+    present_anns = [a for a in annotators
+                    if f"keep_{a}" in merged.columns]
+    pairs  = [(present_anns[i], present_anns[j])
+               for i in range(len(present_anns))
+               for j in range(i + 1, len(present_anns))]
+    kappas = []
+    for a1, a2 in pairs:
+        k = cohen_kappa_score(merged[f"keep_{a1}"],
+                              merged[f"keep_{a2}"])
+        kappas.append(k)
+        print(f"  {a1} vs {a2}: κ = {k:.3f}")
+
+    avg_k = np.mean(kappas)
+    print(f"\n  Average κ: {avg_k:.3f}")
+
+    if   avg_k >= 0.80: interp = "Almost perfect agreement"
+    elif avg_k >= 0.60: interp = "Substantial agreement"
+    elif avg_k >= 0.40: interp = "Moderate agreement — acceptable"
+    else:               interp = "Poor — revise annotation guidelines"
+    print(f"  Interpretation: {interp}")
+
+    # Majority vote (3 or more → keep)
+    merged["keep_votes"] = merged[keep_cols].sum(axis=1)
+    merged["final_keep"] = (merged["keep_votes"] >= 2).astype(int)
+
+    total             = len(merged)
+    kept              = int(merged["final_keep"].sum())
+    unanimous_keep    = int((merged["keep_votes"] ==
+                              len(keep_cols)).sum())
+    unanimous_discard = int((merged["keep_votes"] == 0).sum())
+
+    print(f"\n  Agreement Summary:")
+    print(f"    Total reviewed:          {total}")
+    print(f"    Unanimous keep:          {unanimous_keep}")
+    for v in range(len(keep_cols) - 1, 0, -1):
+        cnt = int((merged["keep_votes"] == v).sum())
+        print(f"    {v}/{len(keep_cols)} keep:                  {cnt}")
+    print(f"    Unanimous discard:       {unanimous_discard}")
+    print(f"    ─────────────────────────")
+    print(f"    Final kept:              {kept}")
+    print(f"    Final discarded:         {total - kept}")
+
+    merged.to_csv("merged_annotations_task1.csv", index=False)
+    print(f"\n  Saved merged_annotations_task1.csv")
+    return merged
+
+merged_ann = merge_task1_annotations(ANNOTATORS)
+
+if len(merged_ann) > 0:
+    kept_premises = merged_ann[
+        merged_ann["final_keep"] == 1][["premise"]]
+    kept_df = kept_premises.merge(raw_df, on="premise", how="left")
+    kept_df.to_csv("kept_sentences.csv", index=False)
+    print(f"  Saved kept_sentences.csv ({len(kept_df)} examples)")
+
+
+
+
+# STAGE 6: BUILD HYPOTHESIS PAIRS
+# Fillers come from your extraction sheet (corpus = filler).
+# Corpus sentences get neutral label + the auto-generated hypothesis.
+# Filler sentences keep their manually written label + hypothesis.
+#
+# FILLER TARGET: 50 entailment + 50 contradiction = 100 total
+
+print("\n" + "=" * 60)
+print("STAGE 6: BUILDING HYPOTHESIS PAIRS")
+print("=" * 60)
+
+def make_hypothesis(premise, scalar_term):
+    if not isinstance(scalar_term, str) or not scalar_term.strip():
+        return None
+    strong = scalar_map.get(scalar_term.strip().lower())
+    if strong is None:
+        return None
+    return re.sub(
+        r"\b" + re.escape(scalar_term.strip()) + r"\b",
+        strong, premise, flags=re.IGNORECASE
+    )
+try:
+    kept_df = pd.read_csv("kept_sentences.csv")
+
+    is_filler  = kept_df["corpus"] == "filler"
+    filler_df  = kept_df[is_filler].copy()
+    corpus_df  = kept_df[~is_filler].copy()
+
+    print(f"  Corpus sentences: {len(corpus_df)}")
+    print(f"  Filler sentences: {len(filler_df)}")
+
+    # Corpus sentences — neutral label, auto hypothesis
+    def resolve_hypothesis(row):
+        if ("hypothesis" in row
+                and pd.notna(row["hypothesis"])
+                and str(row["hypothesis"]).strip() != ""):
+            return str(row["hypothesis"]).strip()
+        return make_hypothesis(row["premise"], row["scalar_term"])
+
+    corpus_df["hypothesis"] = corpus_df.apply(
+        resolve_hypothesis, axis=1)
+    corpus_df["label"] = "neutral"
+    corpus_df = corpus_df.dropna(subset=["hypothesis"])
+    print(f"  Corpus pairs after hypothesis generation: "
+          f"{len(corpus_df)}")
+
+    # Filler sentences — use manually written hypothesis + label
+    if len(filler_df) > 0:
+        filler_df = filler_df.dropna(subset=["hypothesis", "label"])
+        ent  = (filler_df["label"] == "entailment").sum()
+        cont = (filler_df["label"] == "contradiction").sum()
+        print(f"  Fillers — entailment: {ent}, "
+              f"contradiction: {cont}")
+        if abs(ent - cont) > 10:
+            print(f"  WARNING: Filler classes are unbalanced. "
+                  f"Consider adding more to the smaller class.")
+
+    # Combine
+    full_df = pd.concat([corpus_df, filler_df], ignore_index=True)
+    full_df = full_df.drop_duplicates(subset=["premise"])
+    full_df.to_csv("annotated_dataset.csv", index=False)
+
+    print(f"\n  Total dataset: {len(full_df)}")
+    print(f"\n  Label distribution:")
+    print(full_df["label"].value_counts().to_string())
+    print(f"\n  Style × Label:")
+    print(full_df.groupby(["style", "label"])
+                 .size().unstack(fill_value=0).to_string())
+    print(f"\n  Corpus × Label:")
+    print(full_df.groupby(["corpus", "label"])
+                 .size().unstack(fill_value=0).to_string())
+
+    if len(full_df) < 600:
+        print(f"\n  NOTE: Dataset below 700 target. Consider "
+              f"extracting more sentences.")
+
+except FileNotFoundError:
+    print("  kept_sentences.csv not found. Run Stage 5 first.")
+
+
+
+
+# STAGE 7 — DEV / TEST SPLIT (25% dev | 75% test)
+
+print("\n" + "=" * 60)
+print("STAGE 7: DEV / TEST SPLIT (25% dev | 75% test)")
+print("=" * 60)
+
+try:
+    full_df = pd.read_csv("annotated_dataset.csv")
+    full_df["strat_key"] = full_df["style"] + "_" + full_df["label"]
+
+    val_df, test_df = train_test_split(
+        full_df,
+        test_size=0.75,
+        train_size=0.25,
+        random_state=42,
+        stratify=full_df["strat_key"]
+    )
+    val_df  = val_df.drop(columns=["strat_key"])
+    test_df = test_df.drop(columns=["strat_key"])
+
+    val_df.to_csv("validation.csv",  index=False)
+    test_df.to_csv("test.csv",       index=False)
+
+    print(f"  Validation set : {len(val_df)} examples (25%)")
+    print(f"  Test set       : {len(test_df)} examples (75%)")
+    print(f"\n  Validation label distribution:")
+    print(val_df["label"].value_counts().to_string())
+    print(f"\n  Test label distribution:")
+    print(test_df["label"].value_counts().to_string())
+    print(f"\n  Validation style × label:")
+    print(val_df.groupby(["style", "label"])
+                .size().unstack(fill_value=0).to_string())
+    print(f"\n  Test style × label:")
+    print(test_df.groupby(["style", "label"])
+                 .size().unstack(fill_value=0).to_string())
+
+except FileNotFoundError:
+    print("  annotated_dataset.csv not found. Run Stage 6 first.")
+
+
+
+# Stage 7: Validation set 
+
+import time
+import pandas as pd
+
+val_df  = pd.read_csv("validation.csv")
+test_df = pd.read_csv("test.csv")
+sample  = test_df.sample(100, random_state=42)
+
+# Run Sabiá only for now
+print("Running Sabiá zero-shot on validation...")
+val_szs_preds, val_szs_traces = run_generative(
+    val_df, zero_shot_prompt, run_sabia,
+    "Sabia ZS val", max_tokens=20)
+
+print("Running Sabiá zero-shot on test...")
+test_szs_preds, test_szs_traces = run_generative(
+    test_df, zero_shot_prompt, run_sabia,
+    "Sabia ZS test", max_tokens=20)
+
+print("Running Sabiá CoT on 100 sample...")
+test_scot_preds, test_scot_traces = run_generative(
+    sample, cot_prompt, run_sabia,
+    "Sabia CoT sample", max_tokens=400)
+
+# Save Sabiá results immediately
+val_df  = val_df.copy()
+test_df = test_df.copy()
+sample  = sample.copy()
+
+val_df["sabia_zs_pred"]    = val_szs_preds
+val_df["sabia_zs_trace"]   = val_szs_traces
+test_df["sabia_zs_pred"]   = test_szs_preds
+test_df["sabia_zs_trace"]  = test_szs_traces
+sample["sabia_cot_pred"]   = test_scot_preds
+sample["sabia_cot_trace"]  = test_scot_traces
+
+val_df.to_csv("sabia_val_preds.csv", index=False)
+test_df.to_csv("sabia_test_preds.csv", index=False)
+sample.to_csv("sabia_cot_sample.csv", index=False)
+print("Sabiá results saved.")
+
+import pandas as pd
+import time
+
+val_df  = pd.read_csv("validation.csv")
+test_df = pd.read_csv("test.csv")
+sample  = test_df.sample(100, random_state=42)
+
+# mDeBERTa
+print("Running mDeBERTa on validation...")
+val_deberta_preds = run_deberta(val_df)
+print("Running mDeBERTa on test...")
+test_deberta_preds = run_deberta(test_df)
+print("mDeBERTa done. Saving...")
+
+val_df["deberta_pred"]  = val_deberta_preds
+test_df["deberta_pred"] = test_deberta_preds
+val_df.to_csv("deberta_val_preds.csv", index=False)
+test_df.to_csv("deberta_test_preds.csv", index=False)
+print("mDeBERTa saved.")
+
+# Run Claude Haiku
+import time
+
+def run_claude(prompt, max_tokens=300):
+    time.sleep(1.5)  # 1.5 second delay = max 40 requests per minute
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={"x-api-key": ANTHROPIC_KEY,
+                 "anthropic-version": "2023-06-01",
+                 "Content-Type": "application/json"},
+        json={"model": "claude-haiku-4-5-20251001",
+              "max_tokens": max_tokens,
+              "messages": [{"role": "user", "content": prompt}]}
+    )
+    rj = r.json()
+    if "content" not in rj:
+        print(f"Claude error: {rj}")
+        return "unknown"
+    return rj["content"][0]["text"].strip()
+
+val_df  = pd.read_csv("deberta_val_preds.csv")
+test_df = pd.read_csv("deberta_test_preds.csv")
+sample  = test_df.sample(100, random_state=42)
+
+print("Running Claude zero-shot on validation...")
+val_czs_preds, val_czs_traces = run_generative(
+    val_df, zero_shot_prompt, run_claude,
+    "Claude ZS val", max_tokens=20)
+
+print("Running Claude zero-shot on test...")
+test_czs_preds, test_czs_traces = run_generative(
+    test_df, zero_shot_prompt, run_claude,
+    "Claude ZS test", max_tokens=20)
+
+print("Running Claude CoT on 100 sample...")
+test_ccot_preds, test_ccot_traces = run_generative(
+    sample, cot_prompt, run_claude,
+    "Claude CoT sample", max_tokens=400)
+
+val_df  = val_df.copy()
+test_df = test_df.copy()
+sample  = sample.copy()
+
+val_df["claude_zs_pred"]   = val_czs_preds
+val_df["claude_zs_trace"]  = val_czs_traces
+test_df["claude_zs_pred"]  = test_czs_preds
+test_df["claude_zs_trace"] = test_czs_traces
+sample["claude_cot_pred"]  = test_ccot_preds
+sample["claude_cot_trace"] = test_ccot_traces
+
+val_df.to_csv("claude_val_preds.csv", index=False)
+test_df.to_csv("claude_test_preds.csv", index=False)
+sample.to_csv("claude_cot_sample.csv", index=False)
+print("Claude results saved.")
+
+# Stage 8: Merge results
+
+import pandas as pd
+
+val_deberta  = pd.read_csv("deberta_val_preds.csv")
+test_deberta = pd.read_csv("deberta_test_preds.csv")
+sabia_val    = pd.read_csv("sabia_val_preds.csv")
+sabia_test   = pd.read_csv("sabia_test_preds.csv")
+sabia_cot    = pd.read_csv("sabia_cot_sample.csv")
+claude_val   = pd.read_csv("claude_val_preds.csv")
+claude_test  = pd.read_csv("claude_test_preds.csv")
+claude_cot   = pd.read_csv("claude_cot_sample.csv")
+
+# Merge all into one file
+val_final = val_deberta\
+    .merge(sabia_val[["premise","sabia_zs_pred","sabia_zs_trace"]], on="premise", how="left")\
+    .merge(claude_val[["premise","claude_zs_pred","claude_zs_trace"]], on="premise", how="left")
+
+test_final = test_deberta\
+    .merge(sabia_test[["premise","sabia_zs_pred","sabia_zs_trace"]], on="premise", how="left")\
+    .merge(claude_test[["premise","claude_zs_pred","claude_zs_trace"]], on="premise", how="left")\
+    .merge(sabia_cot[["premise","sabia_cot_pred","sabia_cot_trace"]], on="premise", how="left")\
+    .merge(claude_cot[["premise","claude_cot_pred","claude_cot_trace"]], on="premise", how="left")
+
+val_final.to_csv("validation_all_preds.csv", index=False)
+test_final.to_csv("test_all_preds.csv", index=False)
+
+print(f"Val:  {len(val_final)} examples")
+print(f"Test: {len(test_final)} examples")
+print(f"Columns: {test_final.columns.tolist()}")
+print("Ready for Stage 9.")
+
+
+# Export only 50 traces per annotator
+export_50 = export.head(50)
+
+for ann in ["annotator1", "annotator2"]:
+    fname = f"cot_task2_sabia_{ann}.csv"
+    export_50.to_csv(fname, index=False)
+    print(f"Saved: {fname} ({len(export_50)} rows)")
+
+files.download("cot_task2_sabia_annotator1.csv")
+files.download("cot_task2_sabia_annotator2.csv")
+print("Downloads triggered.")
+
+
+# Task 2 CoT scores
+
+from sklearn.metrics import cohen_kappa_score
+
+ANNOTATORS = ["annotator1", "annotator2"]
+
+RUBRIC_QUESTIONS = [
+    "Q1_scalar_identified",
+    "Q2_pragmatic_reasoning",
+    "Q3_label_consistent",
+]
+
+merge_task2_annotations("sabia",  ANNOTATORS, RUBRIC_QUESTIONS)
+merge_task2_annotations("claude", ANNOTATORS, RUBRIC_QUESTIONS)
+
+# STAGE 12 — MERGE TASK 2 ANNOTATIONS + COMPUTE IAA
+# ════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 60)
+print("STAGE 12: MERGING TASK 2 ANNOTATIONS AND COMPUTING IAA")
+print("=" * 60)
+
+RUBRIC_QUESTIONS = [
+    "Q1_scalar_identified",
+    "Q2_pragmatic_reasoning",
+    "Q3_label_consistent",
+]
+
+def merge_task2_annotations(model_name, annotators, questions):
+    dfs = []
+    for ann in annotators:
+        fname = f"cot_task2_{model_name}_{ann}.csv"
+        try:
+            df = pd.read_csv(fname)
+            df = df[["premise"] + questions].rename(
+                columns={q: f"{q}_{ann}" for q in questions}
+            )
+            dfs.append(df)
+            print(f"  Loaded: {fname}")
+        except FileNotFoundError:
+            print(f"  WARNING: {fname} not found — skipping.")
+
+    if not dfs:
+        print(f"  No Task 2 files found for {model_name}.")
+        return
+
+    merged = dfs[0]
+    for df in dfs[1:]:
+        merged = merged.merge(df, on="premise", how="inner")
+
+    present_anns = [a for a in annotators
+                    if f"{questions[0]}_{a}" in merged.columns]
+
+    print(f"\n  IAA Results — {model_name} CoT traces:")
+    print(f"  {'Question':<38} {'Avg κ':>8}")
+    print(f"  {'-'*48}")
+
+    for q in questions:
+        q_cols = [f"{q}_{ann}" for ann in present_anns]
+        sub    = merged[["premise"] + q_cols].dropna()
+        for col in q_cols:
+            sub[col] = sub[col].astype(int)
+        pairs  = [(present_anns[i], present_anns[j])
+                   for i in range(len(present_anns))
+                   for j in range(i+1, len(present_anns))]
+        kappas = [
+            cohen_kappa_score(sub[f"{q}_{a1}"], sub[f"{q}_{a2}"])
+            for a1, a2 in pairs
+        ]
+        print(f"  {q:<38} {np.mean(kappas):>8.3f}")
+        merged[f"{q}_final"] = (
+            merged[q_cols].sum(axis=1) >= 3
+        ).astype(int)
+
+    q_final_cols = [f"{q}_final" for q in questions]
+    summary      = merged[q_final_cols].mean()
+
+    label_map = {
+        "Q1_scalar_identified_final":
+            "Q1: Scalar term identified?",
+        "Q2_pragmatic_reasoning_final":
+            "Q2: Pragmatic reasoning present?",
+        "Q3_label_consistent_final":
+            "Q3: Label consistent with reasoning?",
+    }
+    print(f"\n  Final rubric scores (majority vote, proportion):")
+    for col, label in label_map.items():
+        if col in summary:
+            print(f"    {label:<42} {summary[col]:.2f}")
+
+    merged.to_csv(f"cot_merged_{model_name}.csv", index=False)
+    print(f"\n  Saved cot_merged_{model_name}.csv")
+
+
+merge_task2_annotations("sabia",   ANNOTATORS, RUBRIC_QUESTIONS)
+merge_task2_annotations("claude", ANNOTATORS, RUBRIC_QUESTIONS)
+
+print("\n" + "-" * 60)
+print("PIPELINE COMPLETE")
+print("-" * 60)
+
